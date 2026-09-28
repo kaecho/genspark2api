@@ -35,6 +35,7 @@
   POST /admin/reload          重新读取 accounts.json 与代理池
   POST /admin/quota-check     批量探测额度，耗尽的直接冷却 24h
 """
+import concurrent.futures as cf
 import hashlib
 import json
 import os
@@ -80,6 +81,7 @@ COOLDOWN = {
 }
 MAX_ATTEMPTS = _int_env("GS_MAX_ATTEMPTS", 5)          # 一个请求最多换几个号
 TRANSPORT_RETRIES = _int_env("GS_TRANSPORT_RETRIES", 2)  # 同一个号的传输层重试次数
+SWEEP_CONCURRENCY = _int_env("GS_QUOTA_SWEEP_CONCURRENCY", 4)  # 额度扫描并发度
 POOL_FILE = os.environ.get("GS_PROXY_POOL_FILE", os.path.join(BASE, "proxy_pool.json"))
 ADMIN_TOKEN = os.environ.get("GS_ADMIN_TOKEN", "")
 _state_env = os.environ.get("GS_STATE_FILE", os.path.join(BASE, "cooldown_state.json"))
@@ -879,6 +881,7 @@ def state():
         "settings": {"cooldown_s": COOLDOWN,
                      "max_attempts": MAX_ATTEMPTS,
                      "transport_retries": TRANSPORT_RETRIES,
+                     "sweep_concurrency": SWEEP_CONCURRENCY,
                      "state_file": STATE_FILE or None,
                      "accounts_file": MAP_FILE},
         "quota_exhausted": [a.seq for a in ACCOUNTS
@@ -926,44 +929,54 @@ def admin_quota_check(request: Request):
     confirmed with a second read before the account is parked. Accounts that
     read fine are released from an earlier quota cooldown.
 
-    Query: scope=ready|cooling|all (default all), limit=1..500 (default 50).
-    Runs serially in a worker thread; the response arrives when the batch ends.
+    Query: scope=ready|cooling|all (default all), limit=1..500 (default 50),
+    concurrency=1..16 (default GS_QUOTA_SWEEP_CONCURRENCY). scope=all skips
+    accounts already parked for quota, since re-checking those is what
+    scope=cooling is for. The response arrives when the batch ends.
     """
     _admin_guard(request)
     q = request.query_params
     try:
         limit = max(1, min(int(q.get("limit") or 50), 500))
+        workers = max(1, min(int(q.get("concurrency") or SWEEP_CONCURRENCY), 16))
     except ValueError:
-        raise HTTPException(status_code=400, detail="limit 必须是整数")
+        raise HTTPException(status_code=400, detail="limit/concurrency 必须是整数")
     scope = (q.get("scope") or "all").lower()
     if scope == "ready":
-        todo = [a for a in ACCOUNTS if a.ready][:limit]
+        todo = [a for a in ACCOUNTS if a.ready]
     elif scope == "cooling":
-        todo = [a for a in ACCOUNTS if not a.ready][:limit]
+        todo = [a for a in ACCOUNTS if not a.ready]
     elif scope == "all":
-        todo = ACCOUNTS[:limit]
+        todo = [a for a in ACCOUNTS if not (a.cooldown_reason == "quota" and not a.ready)]
     else:
         raise HTTPException(status_code=400, detail="scope 必须是 ready/cooling/all")
+    todo = todo[:limit]
 
-    checked = exhausted = recovered = unknown = 0
-    for a in todo:
+    def one(a):
         rem = probe_credit(a)
         if rem is None:
-            unknown += 1
-            continue
+            return "unknown"
         if rem == 0:
             time.sleep(0.2)
             if probe_credit(a) == 0:
                 if a.ready or a.cooldown_reason != "quota":
                     a.cooldown("quota")
-                exhausted += 1
-                continue
+                return "exhausted"
         if a.cooldown_reason == "quota":
             a.clear_cooldown()
-            recovered += 1
-        checked += 1
-    return {"ok": True, "scope": scope, "probed": len(todo), "checked": checked,
-            "quota_exhausted": exhausted, "recovered": recovered, "unknown": unknown,
+            return "recovered"
+        return "ok"
+
+    results = {}
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        for r in ex.map(one, todo):
+            results[r] = results.get(r, 0) + 1
+    return {"ok": True, "scope": scope, "probed": len(todo), "concurrency": workers,
+            "quota_exhausted": results.get("exhausted", 0),
+            "recovered": results.get("recovered", 0),
+            "unknown": results.get("unknown", 0),
+            "checked": results.get("ok", 0),
+            "results": results,
             "ready_now": sum(1 for a in ACCOUNTS if a.ready)}
 
 
