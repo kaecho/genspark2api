@@ -185,7 +185,9 @@ curl -X POST "http://127.0.0.1:8899/admin/quota-check?scope=all&limit=200"
 
 That reads the credit endpoint (which costs no credits), confirms a `0` with a second read,
 and parks the account for 24 h. Page through the pool with `limit`, and re-check later with
-`?scope=cooling` to release accounts whose balance came back.
+`?scope=cooling` to release accounts whose balance came back. Probes run concurrently
+(`?concurrency=`, default `GS_QUOTA_SWEEP_CONCURRENCY=4`, capped at 16), and `scope=all`
+skips accounts already parked for quota, so repeat sweeps only touch what is left.
 
 ---
 
