@@ -115,20 +115,35 @@ drift out of sync.
 
 ### Implementation in this bridge
 
-- Each account entry carries an optional `proxy`. Empty means direct.
+- Each account entry carries an optional `proxy`. Empty means "use the pool".
+- A **proxy pool** can be configured in `proxy_pool.json`, in the top level of
+  `accounts.json`, or via `GS_PROXY_POOL`, with `mode` selecting the assignment rule:
+  `sticky` (account index → slot index, the rule described above), `rotate` (a different
+  entry per upstream request), `random`, or `off`.
 - A **separate HTTP session per account**, so connection pools and cookie jars never mix.
-- A per-account session is cached, not rebuilt per request (avoids connection churn).
-- The proxy is attached to **every** upstream call, including any refresh path, so no
+- A session is cached per account when its egress is stable; under `rotate` the egress
+  changes every call, so each call gets its own session.
+- The proxy is attached to **every** upstream call, including the credit probe, so no
   request escapes over the default route.
+- A malformed proxy URL raises at startup rather than degrading to a direct connection.
+- `/health` reports the egress per account and `/state` reports the pool, so "is the proxy
+  actually in use?" is answerable without reading traffic.
 
 ```json
 {
+  "proxy_pool": {
+    "mode": "sticky",
+    "proxies": ["socks5h://user:pass@host-a:1080", "http://host-b:8080"]
+  },
   "accounts": [
-    { "seq": 1, "cookie_file": "cookies1.json", "proxy": "http://127.0.0.1:<port1>" },
+    { "seq": 1, "cookie_file": "cookies1.json", "proxy": "" },
     { "seq": 2, "cookie_file": "cookies2.json", "proxy": "http://127.0.0.1:<port2>" }
   ]
 }
 ```
+
+Account 1 draws from the pool (slot 0), account 2 pins its own listener and never touches
+the pool.
 
 ### Operational notes
 
@@ -146,13 +161,24 @@ drift out of sync.
 
 | Condition | Behavior |
 |---|---|
-| Upstream says not logged in | Cool the account down (long), try the next one |
-| Upstream rate-limits | Cool the account down (long), try the next one |
-| Network error | Short cool-down, try the next one |
-| All accounts cooling | Return `429` with an explicit "no account available" error |
+| Credits exhausted (`您的积分已用完`) | Park the account for 24 h, try the next one |
+| Upstream rate-limits | Park the account for 1 h, try the next one |
+| Upstream says not logged in | Park the account for 5 min, try the next one |
+| Canned failure reply or empty body | Park the account for 1 min, try the next one |
+| Network error / HTTP 5xx | Retry the same account twice, then park it for 30 s |
+| All attempts used | Fail the request with the last reason; `429` when nothing is usable |
 | No cookie for an account | Skip it at load time rather than failing at request time |
+
+All cooldowns are configurable (`GS_*_COOLDOWN`) and persisted to `GS_STATE_FILE`, so a
+restart resumes the pool's state instead of re-admitting accounts that just failed.
 
 **Distinguish "rate-limited" from "model unavailable".** A rate-limit message is a
 throttle signal, not a model failure — misclassifying it produces a model list full of
 false negatives. When probing availability, go serial with a generous interval, and treat
 a throttle response as "unknown", not "broken".
+
+**Distinguish "used up" from "never granted".** An account whose credits are gone still
+answers `/api/is_login` with `is_login: true` and a valid `cogen_id`; only a chat request
+reveals the refusal. That is why session validity is not a health check for the pool, and
+why the cooldown is keyed on the chat outcome (or, for bulk sweeps, on the credit
+endpoint).

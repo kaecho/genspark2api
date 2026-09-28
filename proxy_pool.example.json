@@ -1,0 +1,7 @@
+{
+  "mode": "sticky",
+  "proxies": [
+    "socks5h://user:password@proxy-a.example:1080",
+    "http://user:password@proxy-b.example:8080"
+  ]
+}

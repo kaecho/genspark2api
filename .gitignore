@@ -7,6 +7,11 @@ gs_account*.json
 gs_export[0-9]*.py
 .proceed
 
+# ---- Runtime state / local config (may carry proxy credentials) ----
+proxy_pool.json
+cooldown_state.json
+state/
+
 # ---- Browser profile / runtime state ----
 profile/
 profile_*/

@@ -5,24 +5,47 @@
 
 多账号轮转：
   读 accounts.json → 每个号一份 cookie + 独立 proxy
-  轮转策略：round-robin + 失败自动切下一个号
-  429/配额耗尽 → 冷却该号，切下一个
+  选号：least-recently-used（并发请求拿到不同的号）
+  失败/限额 → 按原因冷却该号，本请求换下一个号重试
+
+代理池（三选一，优先级从高到低）：
+  1. 账号条目里的 proxy            —— 该号专用，最高优先级
+  2. proxy_pool.json / GS_PROXY_POOL —— 代理池，mode 决定怎么分配
+  3. accounts.json 顶层 proxy_default / GS_PROXY —— 单代理兜底
+
+  代理池 mode：
+    sticky  账号下标 N → 池内槽位 N（重启后仍固定，便于按出口排查）
+    rotate  每次上游请求换一个出口
+    random  每次随机
+    off     不使用代理池
+
+冷却（环境变量可覆盖，单位秒）：
+  GS_QUOTA_COOLDOWN=86400        积分耗尽（默认 24 小时）
+  GS_RATE_COOLDOWN=3600          触发上游频率限制
+  GS_NOTLOGIN_COOLDOWN=300       cookie 失效 / 未登录
+  GS_ERROR_COOLDOWN=30           网络与传输错误
+  GS_PLACEHOLDER_COOLDOWN=60     上游返回占位回复
+  GS_STATE_FILE=cooldown_state.json  冷却状态落盘，重启后不丢
 
 端点：
-  POST /v1/chat/completions   (OpenAI 兼容，支持 stream)
+  POST /v1/chat/completions   (OpenAI 兼容，支持 stream / tools)
   GET  /v1/models
-  GET  /health
-  GET  /state
+  GET  /health                每个账号的 ready / 冷却原因 / 出口 / 计数
+  GET  /state                 汇总视图：可用数、冷却分布、池状态
+  POST /admin/reload          重新读取 accounts.json 与代理池
+  POST /admin/quota-check     批量探测额度，耗尽的直接冷却 24h
 """
+import hashlib
 import json
 import os
+import random
 import re
 import threading
 import time
 import uuid
 
 from curl_cffi import requests as cffi
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +56,34 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
 UPSTREAM = "https://www.genspark.ai/api/agent/ask_proxy"
 REFERER = "https://www.genspark.ai/agents?type=ai_chat"
+CREDIT_API = "https://www.genspark.ai/api/credit_audit/billing_cycle"
+IS_LOGIN_API = "https://www.genspark.ai/api/is_login"
+
+
+def _int_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} 必须是整数，收到 {raw!r}")
+
+
+# 冷却时长（秒）。按失败原因区分：积分耗尽要冷却一整天，网络抖动只冷却几十秒。
+COOLDOWN = {
+    "quota": _int_env("GS_QUOTA_COOLDOWN", 86400),
+    "rate": _int_env("GS_RATE_COOLDOWN", 3600),
+    "notlogin": _int_env("GS_NOTLOGIN_COOLDOWN", 300),
+    "error": _int_env("GS_ERROR_COOLDOWN", 30),
+    "placeholder": _int_env("GS_PLACEHOLDER_COOLDOWN", 60),
+}
+MAX_ATTEMPTS = _int_env("GS_MAX_ATTEMPTS", 5)          # 一个请求最多换几个号
+TRANSPORT_RETRIES = _int_env("GS_TRANSPORT_RETRIES", 2)  # 同一个号的传输层重试次数
+POOL_FILE = os.environ.get("GS_PROXY_POOL_FILE", os.path.join(BASE, "proxy_pool.json"))
+ADMIN_TOKEN = os.environ.get("GS_ADMIN_TOKEN", "")
+_state_env = os.environ.get("GS_STATE_FILE", os.path.join(BASE, "cooldown_state.json"))
+STATE_FILE = "" if _state_env.strip().lower() in ("", "off", "none", "0") else _state_env
 
 # 模型清单（2026-09-23 实测 53 个中 50 个可用）
 MODELS = [
@@ -61,36 +112,310 @@ ALIAS = {
 }
 
 LOCK = threading.Lock()
-_rr = 0
+
+PROXY_SCHEMES = ("http://", "https://", "socks4://", "socks4a://",
+                 "socks5://", "socks5h://")
+
+
+def validate_proxy(url):
+    """Fail closed on a malformed proxy URL.
+
+    Ignoring a bad URL would send the request over the default route instead,
+    which leaks the host IP and defeats the whole point of the egress pool.
+    """
+    if not url:
+        return ""
+    u = str(url).strip()
+    if not u.lower().startswith(PROXY_SCHEMES):
+        raise RuntimeError(
+            f"代理地址缺少 scheme: {u[:32]!r}（应为 http:// 或 socks5h:// 之类）")
+    hostport = u.split("://", 1)[1].rsplit("@", 1)[-1]
+    if not hostport or ":" not in hostport:
+        raise RuntimeError(f"代理地址缺少 host:port: {u[:32]!r}")
+    return u
+
+
+def mask_proxy(url):
+    """Hide proxy credentials before they reach /health or a response body."""
+    if not url:
+        return ""
+    if "@" in url:
+        scheme, rest = url.split("://", 1)
+        return f"{scheme}://***@{rest.rsplit('@', 1)[1]}"
+    return url
+
+
+def proxies_dict(url):
+    if not url:
+        return None
+    return {"https": url, "http": url}
+
+
+class ProxyPool:
+    """Egress pool. mode: off / sticky / rotate / random."""
+
+    def __init__(self, proxies, mode="", source=""):
+        self.proxies = [p for p in (validate_proxy(x) for x in proxies) if p]
+        mode = (mode or "").strip().lower()
+        if not self.proxies:
+            mode = "off"
+        elif not mode:
+            mode = "sticky"
+        if mode not in ("off", "sticky", "rotate", "random"):
+            raise RuntimeError(f"未知代理池模式 {mode!r}（可选 off/sticky/rotate/random）")
+        self.mode = mode
+        self.source = source
+        self._n = 0
+
+    @property
+    def enabled(self):
+        return self.mode != "off" and bool(self.proxies)
+
+    def sticky(self, index):
+        """Account index -> slot. Stable across restarts by design."""
+        if not self.proxies:
+            return ""
+        return self.proxies[index % len(self.proxies)]
+
+    def rotate(self):
+        with LOCK:
+            url = self.proxies[self._n % len(self.proxies)]
+            self._n += 1
+        return url
+
+    def pick(self, index):
+        if not self.enabled:
+            return ""
+        if self.mode == "sticky":
+            return self.sticky(index)
+        if self.mode == "rotate":
+            return self.rotate()
+        return random.choice(self.proxies)
+
+    def label(self, index):
+        """Readable egress label for /health (not fixed under rotate/random)."""
+        if not self.enabled:
+            return ""
+        if self.mode == "sticky":
+            return self.sticky(index)
+        return f"<pool:{self.mode}, {len(self.proxies)} proxies>"
+
+    def info(self):
+        return {"mode": self.mode, "size": len(self.proxies), "source": self.source,
+                "proxies": [mask_proxy(p) for p in self.proxies[:8]]}
+
+
+def load_pool(accounts_doc=None):
+    """Pool sources, highest priority first.
+
+    GS_PROXY_POOL > proxy_pool.json > accounts.json (proxy_pool/proxy_default) >
+    GS_PROXY. An empty pool means accounts without their own `proxy` go direct.
+    """
+    raw = os.environ.get("GS_PROXY_POOL", "")
+    proxies = [p for p in re.split(r"[,\s]+", raw) if p.strip()]
+    mode = os.environ.get("GS_PROXY_MODE", "")
+    source = "env GS_PROXY_POOL" if proxies else ""
+
+    if not proxies and os.path.exists(POOL_FILE):
+        doc = json.load(open(POOL_FILE, encoding="utf-8"))
+        if isinstance(doc, list):
+            proxies = [str(x) for x in doc]
+        elif isinstance(doc, dict):
+            proxies = [str(x) for x in (doc.get("proxies") or [])]
+            mode = mode or str(doc.get("mode") or "")
+        source = POOL_FILE
+
+    if not proxies and accounts_doc:
+        doc = accounts_doc.get("proxy_pool")
+        if isinstance(doc, list):
+            proxies = [str(x) for x in doc]
+            source = MAP_FILE
+        elif isinstance(doc, dict):
+            proxies = [str(x) for x in (doc.get("proxies") or [])]
+            mode = mode or str(doc.get("mode") or "")
+            source = MAP_FILE
+        if not proxies and accounts_doc.get("proxy_default"):
+            proxies = [str(accounts_doc["proxy_default"])]
+            source = f"{MAP_FILE} (proxy_default)"
+
+    if not proxies and os.environ.get("GS_PROXY"):
+        proxies = [os.environ["GS_PROXY"]]
+        source = "env GS_PROXY"
+
+    pool = ProxyPool(proxies, mode, source)
+    print(f"[init] 代理池: mode={pool.mode} size={len(pool.proxies)} "
+          f"source={pool.source or '-'}", flush=True)
+    return pool
+
+
+class StateStore:
+    """Cooldown persistence.
+
+    Without it every restart re-admits accounts whose credits are gone, and the
+    pool burns attempts rediscovering them. Keyed by a cookie hash, not by seq,
+    so regenerating accounts.json does not resurrect a cooled-down account.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.data = {}
+        self.writable = bool(path)
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                doc = json.load(open(path, encoding="utf-8"))
+                if isinstance(doc, dict):
+                    self.data = doc
+        except Exception as e:
+            print(f"[state] 冷却状态读取失败，忽略: {type(e).__name__}: {e}", flush=True)
+
+    def get(self, key):
+        if not key:
+            return 0.0, ""
+        ent = self.data.get(key)
+        if not isinstance(ent, dict):
+            return 0.0, ""
+        try:
+            return float(ent.get("until") or 0), str(ent.get("reason") or "")
+        except (TypeError, ValueError):
+            return 0.0, ""
+
+    def clear(self, key):
+        if not key or not self.writable or key not in self.data:
+            return
+        with self.lock:
+            self.data.pop(key, None)
+            self._flush()
+
+    def set(self, key, until, reason):
+        if not key or not self.writable:
+            return
+        with self.lock:
+            self.data[key] = {"until": round(until, 3), "reason": reason,
+                              "at": round(time.time(), 3)}
+            horizon = time.time() - 30 * 86400
+            for k, v in list(self.data.items()):
+                if isinstance(v, dict):
+                    try:
+                        if float(v.get("at") or 0) < horizon:
+                            del self.data[k]
+                    except (TypeError, ValueError):
+                        del self.data[k]
+            self._flush()
+
+    def _flush(self):
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            self.writable = False
+            print(f"[state] 写入 {self.path} 失败，本次运行不再落盘: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+
+STATE = StateStore(STATE_FILE)
 
 
 class Account:
-    def __init__(self, d):
+    def __init__(self, d, index=0):
         self.seq = d.get("seq")
         self.email = d.get("email")
         self.cogen_id = d.get("cogen_id")
-        cf = d.get("cookie_file")
-        self.cookie_file = cf
-        self.proxy = d.get("proxy") or d.get("proxy_default") or os.environ.get("GS_PROXY", "")
+        self.cookie_file = d.get("cookie_file")
+        # 账号自带出口优先于代理池；这里只解析它自己的，池留到请求时再取
+        self.proxy = validate_proxy(str(d.get("proxy") or "").strip())
+        self.index = index
         self.cookie = ""
         self.cooldown_until = 0.0
-        self.stats = {"ok": 0, "fail": 0, "throttle": 0}
+        self.cooldown_reason = ""
+        self.last_used = 0.0
+        self.state_key = ""
+        self.stats = {"ok": 0, "fail": 0, "throttle": 0, "quota": 0}
+        self._session = None
+        self._session_proxy = None
         self.load()
 
     def load(self):
-        if not self.cookie_file or not os.path.exists(self.cookie_file):
-            self.cookie = ""
-            return
-        d = json.load(open(self.cookie_file, encoding="utf-8"))
-        self.cookie = "; ".join(f"{c['name']}={c['value']}"
-                                for c in d.get("cookies", []) if c.get("name"))
+        self.cookie = ""
+        path = self.resolve_cookie_file()
+        if path:
+            d = json.load(open(path, encoding="utf-8"))
+            self.cookie = "; ".join(f"{c['name']}={c['value']}"
+                                    for c in d.get("cookies", []) if c.get("name"))
+        self.state_key = ("ck:" + hashlib.md5(self.cookie.encode()).hexdigest()[:12]
+                          if self.cookie else "")
+        until, reason = STATE.get(self.state_key)   # 重启后沿用落盘的冷却
+        if until > time.time():
+            self.cooldown_until, self.cooldown_reason = until, reason
+
+    def resolve_cookie_file(self):
+        """Find the cookie file, looking next to accounts.json as a fallback.
+
+        Relative paths were resolved against the process working directory only,
+        which silently drops every account when the bridge is started from
+        somewhere else (or when GS_ACCOUNTS points at another directory).
+        """
+        cf = self.cookie_file
+        if not cf:
+            return ""
+        if os.path.isabs(cf):
+            return cf if os.path.exists(cf) else ""
+        if os.path.exists(cf):
+            return cf
+        alt = os.path.join(os.path.dirname(os.path.abspath(MAP_FILE)), cf)
+        return alt if os.path.exists(alt) else ""
 
     @property
     def ready(self):
         return bool(self.cookie) and time.time() >= self.cooldown_until
 
-    def cooldown(self, secs):
+    def cooldown(self, reason, secs=None):
+        """Mark the account unusable and remember why.
+
+        `quota` is the 24h one: the account still answers `/api/is_login`, but
+        the upstream refuses every chat, so retrying it minutes later only
+        wastes attempts.
+        """
+        secs = COOLDOWN.get(reason, COOLDOWN["error"]) if secs is None else secs
         self.cooldown_until = time.time() + secs
+        self.cooldown_reason = reason
+        if reason in ("quota", "rate"):
+            self.stats["throttle"] += 1
+        if reason == "quota":
+            self.stats["quota"] += 1
+        else:
+            self.stats["fail"] += 1
+        STATE.set(self.state_key, self.cooldown_until, reason)
+
+    def clear_cooldown(self):
+        self.cooldown_until, self.cooldown_reason = 0.0, ""
+        STATE.clear(self.state_key)
+
+    def proxy_for(self, pool):
+        """Per-account proxy first, then the pool. Empty means direct."""
+        return self.proxy or pool.pick(self.index)
+
+    def egress_label(self, pool):
+        return mask_proxy(self.proxy) or mask_proxy(pool.label(self.index)) or "direct"
+
+    def session(self, proxy):
+        """HTTP session for one upstream call.
+
+        Cached per account when the egress is stable (sticky pool or per-account
+        proxy) so connections are reused. Under rotate/random the egress changes
+        every call, so a fresh session is required. LRU selection hands distinct
+        accounts to concurrent requests, so a cached session never has two
+        in-flight users.
+        """
+        if self._session is None or self._session_proxy != proxy:
+            self._session = cffi.Session(impersonate="chrome",
+                                         proxies=proxies_dict(proxy))
+            self._session_proxy = proxy
+        return self._session
 
     def headers(self):
         rid = "|" + uuid.uuid4().hex + "." + uuid.uuid4().hex[:16]
@@ -102,39 +427,57 @@ class Account:
             "traceparent": f"00-{p[0]}-{p[1]}-01", "Cookie": self.cookie,
         }
 
-    @property
-    def proxies(self):
-        return {"https": self.proxy, "http": self.proxy}
+
+POOL = ProxyPool([], "off", "")
+ACCOUNTS = []
 
 
 def load_accounts():
+    """(Re)read accounts.json plus the proxy pool, and swap the pool in place."""
+    global ACCOUNTS, POOL
     if not os.path.exists(MAP_FILE):
         raise RuntimeError(f"缺少 {MAP_FILE}")
-    d = json.load(open(MAP_FILE, encoding="utf-8"))
+    doc = json.load(open(MAP_FILE, encoding="utf-8"))
+    POOL = load_pool(doc)
     accts = []
-    for a in d.get("accounts", []):
+    skipped = 0
+    for i, a in enumerate(doc.get("accounts", [])):
         if a.get("status") == "disabled":
             continue
-        acc = Account(a)
+        acc = Account(a, i)
         if acc.cookie:
             accts.append(acc)
+        else:
+            skipped += 1
+            print(f"[init] 跳过 seq={a.get('seq')} {a.get('email')}: "
+                  f"读不到 cookie（{a.get('cookie_file')}）", flush=True)
+    ACCOUNTS = accts
+    if skipped:
+        print(f"[init] 共跳过 {skipped} 个无 cookie 的账号", flush=True)
     return accts
 
 
-ACCOUNTS = load_accounts()
+load_accounts()
 print(f"[init] 加载 {len(ACCOUNTS)} 个账号: "
-      f"{[(a.seq, a.email[:22]) for a in ACCOUNTS]}", flush=True)
+      f"{[(a.seq, (a.email or '')[:22]) for a in ACCOUNTS[:8]]}"
+      + ("…" if len(ACCOUNTS) > 8 else ""), flush=True)
 
 
-def pick():
-    """round-robin 选可用账号"""
-    global _rr
+def pick(exclude=()):
+    """Least-recently-used pick.
+
+    Not a round-robin cursor: `ready` shrinks as accounts cool down, and an
+    index cursor then keeps re-serving whatever sits at the front of the list.
+    LRU spreads load over the pool, and because `last_used` is stamped under the
+    lock, two concurrent requests never get the same account.
+    """
     with LOCK:
-        ready = [a for a in ACCOUNTS if a.ready]
+        skip = set(exclude)
+        ready = [a for a in ACCOUNTS if a.ready and a.seq not in skip]
         if not ready:
             return None
-        a = ready[_rr % len(ready)]
-        _rr += 1
+        a = min(ready, key=lambda x: x.last_used)
+        a.last_used = time.time()
         return a
 
 
@@ -387,8 +730,86 @@ def is_upstream_error(text):
     ))
 
 
+QUOTA_MARKERS = ("积分已用完", "积分用完", "credit exhausted", "credits exhausted",
+                 "out of credits", "insufficient credit", "run out of credit")
+RATE_MARKERS = ("too quickly", "rate limit", "rate-limit", "too many requests",
+                "请求过于频繁", "频率限制")
+NOTLOGIN_MARKERS = ("not login", "not logged in", "unauthorized", "登录已过期",
+                    "please log in", "session expired")
+CANNED_MAX = 300
+
+
+def classify_reason(text, status=None):
+    """Map an upstream reply to a cooldown reason.
+
+    Only the upstream's own refusal text is classified, never a model's prose: a
+    long answer that happens to mention credits must not cool the account for a
+    day. Hence the length gate.
+
+    Returns "quota" | "rate" | "notlogin" | "error" | None.
+    """
+    if status in (401, 403):
+        return "notlogin"
+    if status == 429:
+        return "rate"
+    if isinstance(status, int) and status >= 500:
+        return "error"
+    if not text:
+        return None
+    t = text.strip()
+    if len(t) > CANNED_MAX:
+        return None
+    low = t.lower()
+    for m in QUOTA_MARKERS:
+        if m in t or m in low:
+            return "quota"
+    for m in RATE_MARKERS:
+        if m in low:
+            return "rate"
+    for m in NOTLOGIN_MARKERS:
+        if m in low:
+            return "notlogin"
+    return None
+
+
+def post_upstream(acct, body, proxy, stream=False, timeout=120):
+    """POST to the upstream, retrying transport failures on the same account.
+
+    A dropped connection or an empty 5xx reply is worth one more try before
+    burning a whole account rotation on it. The retry happens before any byte of
+    a streaming response is handed to the client, so it is always safe.
+    """
+    tries = max(1, TRANSPORT_RETRIES)
+    last = None
+    for i in range(tries):
+        try:
+            s = acct.session(proxy)
+            r = s.post(UPSTREAM, headers=acct.headers(),
+                       data=json.dumps(body), timeout=timeout, stream=stream)
+            if not stream and r.status_code >= 500 and i + 1 < tries:
+                last = f"http {r.status_code}"
+                time.sleep(0.4 * (i + 1))
+                continue
+            return r
+        except Exception as e:
+            last = e
+            if i + 1 < tries:
+                time.sleep(0.4 * (i + 1))
+                continue
+            raise
+    if isinstance(last, Exception):
+        raise last
+    raise RuntimeError(str(last))
+
+
 def parse_sse(text):
-    content, deltas, throttle, err = None, [], None, None
+    """Parse the upstream SSE body.
+
+    Returns (content, joined_deltas, reason, err). `reason` is a cooldown reason
+    when the body carries one of the upstream's canned refusals, which is what
+    lets the caller cool the account down for the right amount of time.
+    """
+    content, deltas, reason, err = None, [], None, None
     for line in text.split("\n"):
         if not line.startswith("data: "):
             continue
@@ -403,30 +824,147 @@ def parse_sse(text):
             deltas.append(j.get("delta") or "")
         if t == "message_result" and isinstance(j.get("message"), dict):
             mc = j["message"].get("content") or ""
-            if "too quickly" in mc or "Rate limit" in mc or "积分已用完" in mc:
-                throttle = mc[:200]
+            r = classify_reason(mc)
+            if r:
+                reason = reason or r
             elif not content:
                 content = mc
         if t == "error":
             err = json.dumps(j)[:300]
-    return content, "".join(deltas), throttle, err
+    return content, "".join(deltas), reason, err
 
 
 app = FastAPI()
 START = time.time()
 
 
+def _admin_guard(request):
+    if ADMIN_TOKEN and request.headers.get("x-admin-token") != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="admin token required")
+
+
 @app.get("/health")
 def health():
+    now = time.time()
     return {
-        "ok": True, "uptime_s": round(time.time() - START, 1),
+        "ok": True, "uptime_s": round(now - START, 1),
+        "pool": POOL.info(),
         "accounts": [{
-            "seq": a.seq, "email": a.email[:26],
+            "seq": a.seq, "email": (a.email or "")[:26],
             "ready": a.ready,
-            "cooldown_left_s": max(0, round(a.cooldown_until - time.time())),
+            "cooldown_left_s": max(0, round(a.cooldown_until - now)),
+            "cooldown_reason": a.cooldown_reason,
+            "egress": a.egress_label(POOL),
             "stats": a.stats,
         } for a in ACCOUNTS],
     }
+
+
+@app.get("/state")
+def state():
+    """Aggregate view: how much of the pool is usable right now, and why not."""
+    now = time.time()
+    cooling = {}
+    for a in ACCOUNTS:
+        if a.ready:
+            continue
+        r = a.cooldown_reason or "unknown"
+        cooling[r] = cooling.get(r, 0) + 1
+    return {
+        "uptime_s": round(now - START, 1),
+        "pool": POOL.info(),
+        "accounts": {"total": len(ACCOUNTS),
+                     "ready": sum(1 for a in ACCOUNTS if a.ready),
+                     "cooling": cooling},
+        "settings": {"cooldown_s": COOLDOWN,
+                     "max_attempts": MAX_ATTEMPTS,
+                     "transport_retries": TRANSPORT_RETRIES,
+                     "state_file": STATE_FILE or None,
+                     "accounts_file": MAP_FILE},
+        "quota_exhausted": [a.seq for a in ACCOUNTS
+                            if a.cooldown_reason == "quota" and a.cooldown_until > now][:200],
+    }
+
+
+@app.post("/admin/reload")
+def admin_reload(request: Request):
+    """Re-read accounts.json and the proxy pool without restarting the bridge."""
+    _admin_guard(request)
+    before = len(ACCOUNTS)
+    try:
+        accts = load_accounts()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    return {"ok": True, "accounts_before": before, "accounts_after": len(accts),
+            "ready": sum(1 for a in accts if a.ready), "pool": POOL.info()}
+
+
+def probe_credit(acct):
+    """Remaining credits for one account, or None when unknown.
+
+    The billing endpoint spends nothing (unlike a chat request), which is what
+    makes a whole-pool quota sweep affordable.
+    """
+    try:
+        h = acct.headers()
+        h["Accept"] = "application/json, text/plain, */*"
+        r = acct.session(acct.proxy_for(POOL)).get(CREDIT_API, headers=h, timeout=25)
+        if r.status_code != 200:
+            return None
+        data = (r.json() or {}).get("data") or {}
+        rem = data.get("remaining")
+        return rem if isinstance(rem, int) else None
+    except Exception:
+        return None
+
+
+@app.post("/admin/quota-check")
+def admin_quota_check(request: Request):
+    """Probe credit balances and park exhausted accounts for the quota cooldown.
+
+    A single 0 can be a stale cache read (the upstream syncs lazily), so a 0 is
+    confirmed with a second read before the account is parked. Accounts that
+    read fine are released from an earlier quota cooldown.
+
+    Query: scope=ready|cooling|all (default all), limit=1..500 (default 50).
+    Runs serially in a worker thread; the response arrives when the batch ends.
+    """
+    _admin_guard(request)
+    q = request.query_params
+    try:
+        limit = max(1, min(int(q.get("limit") or 50), 500))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="limit 必须是整数")
+    scope = (q.get("scope") or "all").lower()
+    if scope == "ready":
+        todo = [a for a in ACCOUNTS if a.ready][:limit]
+    elif scope == "cooling":
+        todo = [a for a in ACCOUNTS if not a.ready][:limit]
+    elif scope == "all":
+        todo = ACCOUNTS[:limit]
+    else:
+        raise HTTPException(status_code=400, detail="scope 必须是 ready/cooling/all")
+
+    checked = exhausted = recovered = unknown = 0
+    for a in todo:
+        rem = probe_credit(a)
+        if rem is None:
+            unknown += 1
+            continue
+        if rem == 0:
+            time.sleep(0.2)
+            if probe_credit(a) == 0:
+                if a.ready or a.cooldown_reason != "quota":
+                    a.cooldown("quota")
+                exhausted += 1
+                continue
+        if a.cooldown_reason == "quota":
+            a.clear_cooldown()
+            recovered += 1
+        checked += 1
+    return {"ok": True, "scope": scope, "probed": len(todo), "checked": checked,
+            "quota_exhausted": exhausted, "recovered": recovered, "unknown": unknown,
+            "ready_now": sum(1 for a in ACCOUNTS if a.ready)}
 
 
 @app.get("/v1/models")
@@ -444,44 +982,38 @@ async def chat(req: Request):
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
 
-    # 尝试轮转（最多试 5 个号）
-    # 上游偶发返回占位符（约 1/3 概率），需要留足重试余量
+    # 一个请求最多换 MAX_ATTEMPTS 个号。上游偶发返回占位符（约 1/3 概率），
+    # 加上积分耗尽的号，需要留足重试余量。
+    tried = set()
     last_err = None
-    for attempt in range(5):
-        acct = pick()
+    for attempt in range(MAX_ATTEMPTS):
+        acct = pick(exclude=tried)
         if acct is None:
             return JSONResponse(
                 {"error": {"message": "所有账号都在冷却中（配额耗尽）",
                            "type": "no_account"}}, status_code=429)
-        s = cffi.Session(impersonate="chrome")
+        tried.add(acct.seq)
+        proxy = acct.proxy_for(POOL)
 
         if not want_stream:
             try:
-                r = s.post(UPSTREAM, headers=acct.headers(),
-                           data=json.dumps(body), proxies=acct.proxies, timeout=120)
+                r = post_upstream(acct, body, proxy)
                 t = r.text
             except Exception as e:
-                acct.stats["fail"] += 1
-                acct.cooldown(30)
+                acct.cooldown("error")
                 last_err = f"{type(e).__name__}: {e}"
                 continue
 
-            if "not login" in t:
-                acct.stats["fail"] += 1
-                acct.cooldown(300)
-                last_err = "not_login"
-                continue
-            if "Rate limit" in t or "too quickly" in t:
-                acct.stats["throttle"] += 1
-                acct.cooldown(3600)
-                last_err = "rate_limit"
+            reason = classify_reason(t, r.status_code)
+            if reason:
+                acct.cooldown(reason)
+                last_err = f"{reason}: {t[:120]}"
                 continue
 
-            content, joined, throttle, err = parse_sse(t)
-            if throttle:
-                acct.stats["throttle"] += 1
-                acct.cooldown(3600)
-                last_err = "throttled"
+            content, joined, reason, err = parse_sse(t)
+            if reason:
+                acct.cooldown(reason)
+                last_err = f"{reason}: {err or ''}"
                 continue
             full = content or joined or ""
 
@@ -489,8 +1021,7 @@ async def chat(req: Request):
             # an empty reply as a real answer. With tools requested, an empty
             # reply also means no contract line was produced.
             if is_upstream_error(full) or not full.strip():
-                acct.stats["fail"] += 1
-                acct.cooldown(60)
+                acct.cooldown("placeholder")
                 last_err = (f"upstream_placeholder: {full[:80]}"
                             if is_upstream_error(full) else "empty reply")
                 continue
@@ -519,27 +1050,30 @@ async def chat(req: Request):
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 "x_genspark": {"account": acct.seq, "email": acct.email[:22],
                                "upstream_status": r.status_code, "raw_len": len(t),
+                               "attempts": attempt + 1,
+                               "egress": mask_proxy(proxy) or "direct",
                                "tool_emulated": bool(payload.get("tools"))},
             })
 
         # 流式
-        # Retries internally: a placeholder reply arrives before anything is
-        # emitted (tools are buffered; without tools we only retry while nothing
-        # has been sent), so the account can still be switched.
+        # 内部自己重试：换号只在"还没有任何字节发给客户端"时才安全，所以带 tools
+        # 的请求全程缓冲，不带 tools 的请求一旦发出第一个 delta 就锁定该号。
         def gen(i=cid, cr=created, mo=model):
             has_tools = bool(payload.get("tools"))
             yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})}\n\n'
             last = None
-            for _ in range(5):
-                a = pick()
+            tried_stream = set()
+            for _ in range(MAX_ATTEMPTS):
+                a = pick(exclude=tried_stream)
                 if a is None:
                     yield f'data: {json.dumps({"error": {"message": "所有账号都在冷却中（配额耗尽）"}})}\n\n'
                     return
+                tried_stream.add(a.seq)
+                pxy = a.proxy_for(POOL)
                 buf, emitted, collected = "", 0, ""
+                seen_reason, stopped = None, False
                 try:
-                    r = cffi.Session(impersonate="chrome").post(
-                        UPSTREAM, headers=a.headers(), data=json.dumps(body),
-                        proxies=a.proxies, timeout=120, stream=True)
+                    r = post_upstream(a, body, pxy, stream=True)
                     for chunk in r.iter_content(chunk_size=None):
                         if not chunk:
                             continue
@@ -564,16 +1098,30 @@ async def chat(req: Request):
                                         yield f'data: {json.dumps({"id": i, "object": "chat.completion.chunk", "created": cr, "model": mo, "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": None}]})}\n\n'
                             elif j.get("type") == "message_result" and isinstance(j.get("message"), dict):
                                 mc = j["message"].get("content") or ""
-                                if ("too quickly" in mc or "Rate limit" in mc or "积分已用完" in mc) and emitted == 0 and not has_tools:
-                                    yield f'data: {json.dumps({"error": {"message": mc[:200]}})}\n\n'
+                                rr = classify_reason(mc)
+                                if rr:
+                                    seen_reason = rr
+                                    stopped = True
+                                    break
+                        if stopped:
+                            break
                 except Exception as e:
                     last = f"{type(e).__name__}: {e}"
-                    a.stats["fail"] += 1
-                    a.cooldown(30)
+                    a.cooldown("error")
                     if emitted == 0:
                         continue
                     yield f'data: {json.dumps({"error": {"message": last}})}\n\n'
                     return
+
+                if seen_reason:
+                    # 上游直接拒绝（额度耗尽/限流/掉登录）：换个号再试一次。
+                    a.cooldown(seen_reason)
+                    last = seen_reason
+                    if emitted:
+                        yield f'data: {json.dumps({"error": {"message": seen_reason}})}\n\n'
+                        yield "data: [DONE]\n\n"
+                        return
+                    continue
 
                 placeholder = is_upstream_error(collected)
                 empty = not collected.strip()
@@ -597,8 +1145,7 @@ async def chat(req: Request):
                         # the reply is either a canned failure or empty. Retry on
                         # another account -- returning an empty stop here would
                         # look like a successful answer.
-                        a.stats["fail"] += 1
-                        a.cooldown(60)
+                        a.cooldown("placeholder")
                         last = ("upstream_placeholder: " + collected[:80]) if placeholder \
                             else "empty reply with tools requested"
                         continue
@@ -609,8 +1156,7 @@ async def chat(req: Request):
                         fin = "stop"
                 else:
                     if (placeholder or empty) and emitted == 0:
-                        a.stats["fail"] += 1
-                        a.cooldown(60)
+                        a.cooldown("placeholder")
                         last = ("upstream_placeholder: " + collected[:80]) if placeholder \
                             else "empty reply"
                         continue

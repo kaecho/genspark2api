@@ -66,14 +66,40 @@ but recommended for per-account egress isolation.
 }
 ```
 
-### 4. Run
+### 4. Configure the proxy pool (optional)
+
+Do this instead of filling `proxy` on every account when you want everything to leave
+through a pool. Accounts with their own `proxy` keep it; every other account draws from
+the pool.
+
+```bash
+cp proxy_pool.example.json proxy_pool.json
+```
+
+```json
+{
+  "mode": "sticky",
+  "proxies": [
+    "socks5h://user:password@host:1080",
+    "http://user:password@host:8080"
+  ]
+}
+```
+
+Then run with a different egress for every upstream request:
+
+```bash
+GS_PROXY_MODE=rotate python genspark2api.py
+```
+
+### 5. Run
 
 ```bash
 python genspark2api.py
 # serving on :8899
 ```
 
-### 5. Call it
+### 6. Call it
 
 ```bash
 curl http://127.0.0.1:8899/v1/chat/completions \
@@ -87,7 +113,108 @@ curl http://127.0.0.1:8899/v1/chat/completions \
 |---|---|
 | `POST /v1/chat/completions` | OpenAI-compatible; supports `stream: true` and `tools` (emulated — see below) |
 | `GET /v1/models` | Model list |
-| `GET /health` | Per-account status: `ready`, `proxy`, `cooldown_left_s`, success/failure counters |
+| `GET /health` | Per-account status: `ready`, `cooldown_reason`, `cooldown_left_s`, `egress`, counters, plus the pool summary |
+| `GET /state` | Aggregate view: usable vs cooling counts, cooldown reasons, settings, `quota_exhausted` seq list |
+| `POST /admin/reload` | Re-read `accounts.json` and the proxy pool without a restart |
+| `POST /admin/quota-check` | Probe credit balances and park exhausted accounts; `?scope=ready\|cooling\|all&limit=N` |
+
+The two `/admin/*` endpoints require an `x-admin-token` header only when `GS_ADMIN_TOKEN`
+is set.
+
+---
+
+## Proxy pool
+
+Three egress sources, checked in this order:
+
+1. `proxy` on the account entry: that account always uses it.
+2. The pool, if one is configured.
+3. `proxy_default` (top level of `accounts.json`) or `GS_PROXY`: one address for everyone.
+
+Pool configuration can live in `proxy_pool.json`, in the top level of `accounts.json`
+under `proxy_pool`, or in the `GS_PROXY_POOL` environment variable (comma or space
+separated). `GS_PROXY_MODE` overrides the file's `mode`.
+
+| Mode | Behavior | Use when |
+|---|---|---|
+| `sticky` (default) | Account index N always maps to pool slot N | You want a stable, explainable egress per account and want to reproduce which address a given account used |
+| `rotate` | A different pool entry for every upstream request | The pool is a rotating gateway, or you want to spread requests across many addresses |
+| `random` | Random pool entry per request | Same as rotate, without the ordering guarantee |
+| `off` | No pool; accounts without their own `proxy` go direct | Single-address setups |
+
+A malformed proxy URL raises at startup. Falling back to a direct connection would leak
+the host IP, which is the failure mode the pool exists to prevent.
+
+`/health` shows the egress label per account (`masked` credentials) and `/state` shows the
+pool summary, so you can confirm traffic really uses the pool instead of assuming it does.
+
+---
+
+## Cooldowns, retries and quota
+
+One client request tries up to `GS_MAX_ATTEMPTS` (default 5) accounts. A failed account is
+parked with a reason and the request moves on to the next one.
+
+| Reason | Trigger | Default cooldown |
+|---|---|---|
+| `quota` | Upstream answers `您的积分已用完` / `credit exhausted` | **24 h** |
+| `rate` | Upstream answers `too quickly` / `Rate limit`, or HTTP 429 | 1 h |
+| `notlogin` | `not login` / HTTP 401 or 403 | 5 min |
+| `placeholder` | Canned failure reply or an empty body | 1 min |
+| `error` | Connection error, timeout, HTTP 5xx | 30 s |
+
+Every value is settable: `GS_QUOTA_COOLDOWN`, `GS_RATE_COOLDOWN`, `GS_NOTLOGIN_COOLDOWN`,
+`GS_PLACEHOLDER_COOLDOWN`, `GS_ERROR_COOLDOWN`.
+
+Two details worth knowing:
+
+- **Transport retries happen first.** `GS_TRANSPORT_RETRIES` (default 2) re-sends on the
+  same account after a dropped connection or a 5xx, before the request spends an account
+  rotation on it. Streaming retries only while nothing has been sent to the client.
+- **The cooldown survives restarts.** With `GS_STATE_FILE` set (default
+  `cooldown_state.json` next to `accounts.json`) the state is written to disk and keyed on a
+  cookie hash, so restarting the container does not re-admit accounts that just failed and
+  burn attempts rediscovering them.
+
+Because a request only learns about an exhausted account by using it, a fresh pool still
+wastes attempts on dead accounts. Sweep the pool once instead:
+
+```bash
+curl -X POST "http://127.0.0.1:8899/admin/quota-check?scope=all&limit=200"
+```
+
+That reads the credit endpoint (which costs no credits), confirms a `0` with a second read,
+and parks the account for 24 h. Page through the pool with `limit`, and re-check later with
+`?scope=cooling` to release accounts whose balance came back.
+
+---
+
+## Docker and releases
+
+Images are built by GitHub Actions and published to GHCR. Nothing is compiled on the
+deployment host.
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+| Event | Workflow | Result |
+|---|---|---|
+| Push to `master`, or a pull request | `.github/workflows/ci.yml` | Byte-compile, dependency import check, image build without pushing |
+| Push a `v*` tag | `.github/workflows/release.yml` | Image pushed to `ghcr.io/<owner>/<repo>` (`latest` plus semver tags) and a GitHub release published |
+
+Cut a release:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+`docker-compose.yml` in this repo already points at
+`ghcr.io/kaecho/genspark2api:latest` with `pull_policy: always`. The image ships code only;
+`accounts.json`, the cookies, `proxy_pool.json` and the cooldown state directory are
+mounts, so the same image serves any account set.
+
 
 ---
 
@@ -290,9 +417,11 @@ only the auxiliary auth cookies does not.
 
 ### Egress isolation
 
-Per-account `proxy` values are supported and recommended. Accounts sharing one egress IP
-are more likely to be rate-limited or restricted together. The bridge attaches a separate
-HTTP session per account, so each account can use its own egress.
+Per-account `proxy` values are supported and recommended, and a shared pool is supported
+for the case where every account should leave through a rotating egress. Accounts sharing
+one egress IP are more likely to be rate-limited or restricted together. The bridge keeps a
+separate HTTP session per account, so cookie jars never mix, and a cached session only ever
+has one in-flight request behind it.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the gateway integration pattern and
 the per-account egress isolation design.
@@ -309,13 +438,18 @@ the per-account egress isolation design.
 ## Project layout
 
 ```
-genspark2api.py          # the proxy (multi-account round-robin, streaming)
+genspark2api.py          # the proxy (multi-account rotation, proxy pool, streaming)
 gs_login.py              # one-time login + cookie export
 signup_e2e.py            # end-to-end signup: register -> solve CAPTCHA -> export -> pool
 gs_reg_driver.py         # browser driver used by signup_e2e.py
 two_captcha.py           # automatic CAPTCHA solving (optional)
 gs_export.py             # cookie export from a browser profile
 accounts.example.json    # account-pool template (copy to accounts.json)
+proxy_pool.example.json  # egress-pool template (copy to proxy_pool.json)
+requirements.txt         # pinned runtime dependencies
+Dockerfile               # image build used by the release workflow
+docker-compose.yml       # deployment file for the published GHCR image
+.github/workflows/       # ci.yml (checks) + release.yml (tag -> image + release)
 docs/ARCHITECTURE.md     # gateway integration + egress isolation design
 DISCLAIMER.md            # full terms — read this
 LICENSE                  # MIT

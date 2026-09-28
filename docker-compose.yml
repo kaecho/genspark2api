@@ -1,0 +1,52 @@
+services:
+  genspark2api:
+    # Built by .github/workflows/release.yml on every v* tag. Nothing is
+    # compiled on the host; `docker compose pull` is the whole deploy step.
+    image: ghcr.io/kaecho/genspark2api:latest
+    container_name: genspark2api
+    restart: unless-stopped
+    pull_policy: always
+    # Published on IPv4 only. The bridge does not authenticate callers
+    # (see docs/ARCHITECTURE.md), so source-IP filtering is enforced outside the
+    # container: DOCKER-USER on IPv4, and 8899 is dropped outright on IPv6
+    # (no IPv6 whitelist). Both persisted in /etc/iptables/rules.v{4,6}.
+    #   iptables  -A DOCKER-USER ! -s <allowed-ip>/32 -i ens3 -p tcp --dport 8899 -j DROP
+    #   ip6tables -A INPUT -p tcp --dport 8899 -j DROP
+    ports:
+      - "0.0.0.0:8899:8899"
+    volumes:
+      - ./accounts.json:/app/accounts.json:ro
+      - ./cookies:/app/cookies:ro
+      # Only needed when an account entry still points at the single-file export
+      # `cookies1.json`. Drop the line if you do not use that layout.
+      - ./cookies1.json:/app/cookies1.json:ro
+      # Proxy pool. Comment the line out to run without one.
+      - ./proxy_pool.json:/app/proxy_pool.json:ro
+      # Cooldown state: survives restarts, so exhausted accounts are not
+      # re-admitted and retried from scratch after every deploy.
+      - ./state:/app/state
+    environment:
+      GS_PORT: "8899"
+      GS_ACCOUNTS: /app/accounts.json
+      GS_PROXY_POOL_FILE: /app/proxy_pool.json
+      GS_STATE_FILE: /app/state/cooldown_state.json
+      # sticky = account index N always uses slot N (easier to reason about);
+      # rotate = a different egress per upstream request.
+      GS_PROXY_MODE: "rotate"
+      # 积分耗尽的号冷却一整天；限流仍按上游的重置窗口（1 小时）算。
+      GS_QUOTA_COOLDOWN: "86400"
+      GS_RATE_COOLDOWN: "3600"
+      # Uncomment to require `x-admin-token` on /admin/*.
+      # GS_ADMIN_TOKEN: "<random-string>"
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8899/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
